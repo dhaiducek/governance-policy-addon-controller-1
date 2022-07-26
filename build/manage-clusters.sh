@@ -1,6 +1,6 @@
 #! /bin/bash
 
-RUN_MODE=${RUN_MODE:-"create"}
+RUN_MODE=${RUN_MODE:-"create-dev"}
 
 # Number of managed clusters
 MANAGED_CLUSTER_COUNT=${MANAGED_CLUSTER_COUNT:-1}
@@ -24,6 +24,9 @@ case ${RUN_MODE} in
   create)
     make kind-deploy-controller
     ;;
+  create-dev)
+    make kind-deploy-controller-dev
+    ;;
 esac
 
 # Deploy a variable number of managed clusters starting with cluster2
@@ -38,7 +41,7 @@ for i in $(seq 2 $((MANAGED_CLUSTER_COUNT+1))); do
     debug)
       make e2e-debug
       ;;
-    create)
+    create | create-dev)
       make kind-deploy-registration-operator-managed
       # Approval takes place on the hub
       export KIND_NAME="${KIND_PREFIX}1"

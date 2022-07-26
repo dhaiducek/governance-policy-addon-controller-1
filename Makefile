@@ -22,6 +22,9 @@ GOBIN_DEFAULT := $(GOPATH)/bin
 export GOBIN ?= $(GOBIN_DEFAULT)
 export PATH=$(LOCAL_BIN):$(GOBIN):$(shell echo $$PATH)
 
+# Test coverage threshold
+export COVERAGE_MIN ?= 75
+
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # This is a requirement for 'setup-envtest.sh' in the test target.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
@@ -40,7 +43,9 @@ all: build
 
 include build/common/Makefile.common.mk
 
+####################################
 ##@ General
+####################################
 
 # The help target prints out all targets with their descriptions organized
 # beneath their categories. The categories are represented by '##@' and the
@@ -66,7 +71,9 @@ clean: ## Clean up generated files.
 	-rm *.kubeconfig-internal
 	-rm -r vendor/
 
+####################################
 ##@ Development
+####################################
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
@@ -82,7 +89,11 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test `go list ./... | grep -v test/e2e` -coverprofile coverage.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test $(TESTARGS) `go list ./... | grep -v test/e2e`
+
+.PHONY: test-coverage
+test-coverage: TESTARGS = -json -cover -covermode=atomic -coverprofile=coverage_unit.out
+test-coverage: test
 
 GOSEC = $(LOCAL_BIN)/gosec
 GOSEC_VERSION = 2.9.6
@@ -95,7 +106,9 @@ gosec:
 gosec-scan: gosec ## Run a gosec scan against the code.
 	$(GOSEC) -fmt sonarqube -out gosec.json -no-fail -exclude-dir=.go ./...
 
+####################################
 ##@ Build
+####################################
 
 .PHONY: build
 build: ## Build manager binary.
@@ -110,8 +123,9 @@ build-images: generate fmt vet
 	@docker build -t ${IMAGE_NAME_AND_VERSION} -f build/Dockerfile .
 	@docker tag ${IMAGE_NAME_AND_VERSION} $(REGISTRY)/$(IMG):$(TAG)
 
+####################################
 ##@ Deployment
-
+####################################
 ifndef ignore-not-found
   ignore-not-found = false
 endif
@@ -150,12 +164,14 @@ envtest: ## Download envtest-setup locally if necessary.
 
 KUBEWAIT ?= $(PWD)/build/common/scripts/kubewait.sh
 
+####################################
 ##@ Kind
-
+####################################
 KIND_NAME ?= policy-addon-ctrl1
 KIND_KUBECONFIG ?= $(PWD)/$(KIND_NAME).kubeconfig
 HUB_KUBECONFIG ?= $(PWD)/$(KIND_NAME).kubeconfig-internal
 MANAGED_CLUSTER_NAME ?= cluster1
+KIND_VERSION ?= latest
 ifneq ($(KIND_VERSION), latest)
 	KIND_ARGS = --image kindest/node:$(KIND_VERSION)
 else
@@ -212,7 +228,7 @@ CONTROLLER_NAMESPACE ?= governance-policy-addon-controller-system
 
 .PHONY: kind-run-local
 kind-run-local: manifests generate fmt vet $(KIND_KUBECONFIG) ## Run the policy-addon-controller locally against the kind cluster.
-	KUBECONFIG=$(KIND_KUBECONFIG) kubectl get ns $(CONTROLLER_NAMESPACE); if [ $$? -ne 0 ] ; then kubectl create ns $(CONTROLLER_NAMESPACE); fi 
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl get ns $(CONTROLLER_NAMESPACE) || KUBECONFIG=$(KIND_KUBECONFIG) kubectl create ns $(CONTROLLER_NAMESPACE)
 	go run ./main.go controller --kubeconfig=$(KIND_KUBECONFIG) --namespace $(CONTROLLER_NAMESPACE)
 
 .PHONY: kind-load-image
@@ -227,10 +243,12 @@ kind-regenerate-controller: manifests generate kustomize $(KIND_KUBECONFIG) ## R
 	mv config/default/kustomization.yaml.tmp config/default/kustomization.yaml
 	KUBECONFIG=$(KIND_KUBECONFIG) kubectl delete -n $(CONTROLLER_NAMESPACE) pods -l=app=governance-policy-addon-controller
 
-DEPLOYMENT_TARGETS := kind-deploy-registration-operator-hub kind-deploy-registration-operator-managed \
-											kind-approve-cluster kind-load-image kind-regenerate-controller
+DEPLOYMENT_TARGETS := kind-deploy-registration-operator-hub kind-deploy-registration-operator-managed kind-approve-cluster
+.PHONY: kind-deploy-controller-dev
+kind-deploy-controller-dev: $(DEPLOYMENT_TARGETS) ## Deploy prerequisites to the kind cluster to run controller locally.
+
 .PHONY: kind-deploy-controller
-kind-deploy-controller: $(DEPLOYMENT_TARGETS) ## Deploy the policy-addon-controller to the kind cluster.
+kind-deploy-controller: kind-deploy-controller-dev kind-load-image kind-regenerate-controller ## Deploy the policy-addon-controller to the kind cluster.
 
 GINKGO = $(LOCAL_BIN)/ginkgo
 .PHONY: e2e-dependencies
@@ -238,8 +256,31 @@ e2e-dependencies: ## Download ginkgo locally if necessary.
 	$(call go-get-tool,github.com/onsi/ginkgo/v2/ginkgo@$(shell awk '/github.com\/onsi\/ginkgo\/v2/ {print $$2}' go.mod))
 
 .PHONY: e2e-test
-e2e-test: e2e-dependencies
-	$(GINKGO) -v --fail-fast --slow-spec-threshold=10s test/e2e
+e2e-test: e2e-dependencies ## Run E2E tests.
+	$(GINKGO) -v --fail-fast --slow-spec-threshold=10s $(E2E_TEST_ARGS) test/e2e
+
+.PHONY: e2e-test-coverage
+e2e-test-coverage: E2E_TEST_ARGS = --json-report=report_e2e.json --output-dir=.
+e2e-test-coverage: e2e-run-instrumented e2e-test e2e-stop-instrumented ## Run E2E tests using instrumented controller.
+
+.PHONY: e2e-build-instrumented
+e2e-build-instrumented:
+	go test -covermode=atomic -coverpkg=$(shell cat go.mod | head -1 | cut -d ' ' -f 2)/... -c -tags e2e ./ -o build/_output/bin/$(IMG)-instrumented
+
+.PHONY: e2e-run-instrumented
+e2e-run-instrumented: e2e-build-instrumented
+	KUBECONFIG=$(KIND_KUBECONFIG) kubectl get ns $(CONTROLLER_NAMESPACE) &>/dev/null || KUBECONFIG=$(KIND_KUBECONFIG) kubectl create ns $(CONTROLLER_NAMESPACE)
+	CONFIG_POLICY_CONTROLLER_IMAGE="$(REGISTRY)/config-policy-controller:$(TAG)" \
+	KUBE_RBAC_PROXY_IMAGE="registry.redhat.io/openshift4/ose-kube-rbac-proxy:v4.10" \
+	GOVERNANCE_POLICY_SPEC_SYNC_IMAGE="$(REGISTRY)/governance-policy-spec-sync:$(TAG)" \
+	GOVERNANCE_POLICY_STATUS_SYNC_IMAGE="$(REGISTRY)/governance-policy-status-sync:$(TAG)" \
+	GOVERNANCE_POLICY_TEMPLATE_SYNC_IMAGE="$(REGISTRY)/governance-policy-template-sync:$(TAG)" \
+	./build/_output/bin/$(IMG)-instrumented -test.coverprofile="coverage_e2e.out" -test.run="^TestRunMain$$" controller --kubeconfig="$(KIND_KUBECONFIG)" --namespace="$(CONTROLLER_NAMESPACE)"
+
+
+.PHONY: e2e-stop-instrumented
+e2e-stop-instrumented:
+	ps -ef | grep '$(IMG)' | grep -v grep | awk '{print $$2}' | xargs kill
 
 .PHONY: e2e-debug
 e2e-debug: ## Collect debug logs from deployed clusters.
@@ -249,6 +290,8 @@ e2e-debug: ## Collect debug logs from deployed clusters.
 	-KUBECONFIG=$(KIND_KUBECONFIG) kubectl -n $(CONTROLLER_NAMESPACE) get pods
 	-KUBECONFIG=$(KIND_KUBECONFIG) kubectl -n open-cluster-management-agent-addon get deployments
 	-KUBECONFIG=$(KIND_KUBECONFIG) kubectl -n open-cluster-management-agent-addon get pods
+	@echo "* Local controller log:""
+	-cat build/_output/controller.log
 	@echo "* Container logs in namespace $(CONTROLLER_NAMESPACE):"
 	-@for POD in $(shell KUBECONFIG=$(KIND_KUBECONFIG) kubectl -n $(CONTROLLER_NAMESPACE) get pods -o name); do \
 		for CONTAINER in $$(KUBECONFIG=$(KIND_KUBECONFIG) kubectl -n $(CONTROLLER_NAMESPACE) get $${POD} -o jsonpath={.spec.containers[*].name}); do \
@@ -278,7 +321,10 @@ fmt: fmt-dependencies
 	find . -not \( -path "./.go" -prune -or -path "./vendor" -prune \) -name "*.go" | xargs gci -w -local "$(shell cat go.mod | head -1 | cut -d " " -f 2)"
 	find . -not \( -path "./.go" -prune -or -path "./vendor" -prune \) -name "*.go" | xargs gofumpt -l -w
 
+####################################
 ##@ Quality Control
+####################################
+
 lint-dependencies:
 	$(call go-get-tool,github.com/golangci/golangci-lint/cmd/golangci-lint@v1.46.2)
 
@@ -287,3 +333,21 @@ lint-dependencies:
 #    eg: lint: lint-go lint-yaml
 .PHONY: lint
 lint: lint-dependencies lint-all ## Run linting against the code.
+
+####################################
+##@ Test Coverage
+####################################
+GOCOVMERGE = $(LOCAL_BIN)/gocovmerge
+.PHONY: coverage-dependencies
+coverage-dependencies:
+	$(call go-get-tool,github.com/wadey/gocovmerge@v0.0.0-20160331181800-b5bfa59ec0ad)
+
+COVERAGE_FILE = coverage.out
+.PHONY: coverage-merge
+coverage-merge: coverage-dependencies ## Merge coverage reports.
+	@echo Merging the coverage reports into $(COVERAGE_FILE)
+	$(GOCOVMERGE) $(PWD)/coverage_* > $(COVERAGE_FILE)
+
+.PHONY: coverage-verify
+coverage-verify: ## Verify coverage percentage meets coverage thresholds.
+	./build/common/scripts/coverage_calc.sh
