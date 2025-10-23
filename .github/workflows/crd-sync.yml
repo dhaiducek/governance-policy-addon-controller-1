@@ -4,6 +4,7 @@ on:
   schedule:
     # every midnight M-F
     - cron:  '0 0 * * 1-5'
+  workflow_dispatch: {}
 
 defaults:
   run:
